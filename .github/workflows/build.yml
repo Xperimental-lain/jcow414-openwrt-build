@@ -1,0 +1,92 @@
+name: Build JCOW414 OpenWrt
+on:
+  workflow_dispatch:
+env:
+  REPO_URL: https://github.com/openwrt/openwrt
+  REPO_BRANCH: main
+  TZ: Asia/Kolkata
+jobs:
+  build:
+    name: Build JCOW414
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget time
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+      - name: Clone OpenWrt source
+        run: git clone $REPO_URL -b $REPO_BRANCH openwrt
+      - name: Cache build
+        uses: klever1988/cachewrtbuild@main
+        with:
+          ccache: 'true'
+          prefix: ${{ github.workspace }}/openwrt
+      - name: Update and install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a -f
+      - name: Generate config for JCOW414
+        run: |
+          cd openwrt
+          cp $GITHUB_WORKSPACE/jcow414.diffconfig .config
+          make defconfig
+          echo "--- verifying critical config symbols ---"
+          for sym in CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_PACKAGE_luci CONFIG_PACKAGE_kmod-usb-storage CONFIG_PACKAGE_wireguard-tools; do
+            grep -q "^${sym}=y" .config || { echo "MISSING: ${sym}"; exit 1; }
+          done
+          TODAY=$(date +%Y-%m-%d)
+          sed -i "s/CONFIG_VERSION_NUMBER=.*/CONFIG_VERSION_NUMBER=\"${TODAY}\"/" .config
+      - name: Download packages
+        run: |
+          cd openwrt
+          make download -j16
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+      - name: Compile firmware
+        id: compile
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+          tdev=$(grep "CONFIG_TARGET_PROFILE" .config | awk -F= '{print $2}' | tr -d '"')
+          DEVICE_NAME=${tdev##DEVICE_}
+          FILE_DATE=_$(date +"%Y%m%d%H%M")
+          GIT_REV=_$(git rev-parse --short HEAD)
+          echo "DEVICE_NAME=${DEVICE_NAME}" >> $GITHUB_ENV
+          echo "FILE_DATE=${FILE_DATE}" >> $GITHUB_ENV
+          echo "GIT_REV=${GIT_REV}" >> $GITHUB_ENV
+          RELEASE_NAME="OpenWrt_${DEVICE_NAME}${GIT_REV}${FILE_DATE}.tar.gz"
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_ENV
+      - name: Pack firmware
+        run: |
+          tar -cvzf ${{ github.workspace }}/${{ env.RELEASE_NAME }} \
+            openwrt/bin/targets/econet/en7528/* \
+            --owner=0 --group=0
+          rm -rf $(find openwrt/bin/targets/ -type d -name "packages")
+          echo "OpenWrt JCOW414 firmware" > Release.txt
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          path: |
+            ${{ github.workspace }}/*.tar.gz
+            Release.txt
+      - name: Create/update pre-release
+        uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          automatic_release_tag: jcow414-latest
+          prerelease: true
+          title: "JCOW414 OpenWrt builds"
+          files: |
+            Release.txt
+            ${{ github.workspace }}/*.tar.gz
